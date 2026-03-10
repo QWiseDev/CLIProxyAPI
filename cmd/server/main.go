@@ -128,6 +128,8 @@ func main() {
 	var err error
 	var cfg *config.Config
 	var isCloudDeploy bool
+	objectStoreBootstrapRetries := 2
+	objectStoreBootstrapRetryDelay := 2 * time.Second
 	var (
 		usePostgresStore     bool
 		pgStoreDSN           string
@@ -301,13 +303,15 @@ func main() {
 		}
 		resolvedEndpoint = strings.TrimRight(resolvedEndpoint, "/")
 		objCfg := store.ObjectStoreConfig{
-			Endpoint:  resolvedEndpoint,
-			Bucket:    objectStoreBucket,
-			AccessKey: objectStoreAccess,
-			SecretKey: objectStoreSecret,
-			LocalRoot: objectStoreRoot,
-			UseSSL:    useSSL,
-			PathStyle: true,
+			Endpoint:         resolvedEndpoint,
+			Bucket:           objectStoreBucket,
+			AccessKey:        objectStoreAccess,
+			SecretKey:        objectStoreSecret,
+			LocalRoot:        objectStoreRoot,
+			UseSSL:           useSSL,
+			PathStyle:        true,
+			BootstrapRetries: objectStoreBootstrapRetries,
+			RetryDelay:       objectStoreBootstrapRetryDelay,
 		}
 		objectStoreInst, err = store.NewObjectTokenStore(objCfg)
 		if err != nil {
@@ -315,13 +319,16 @@ func main() {
 			return
 		}
 		examplePath := filepath.Join(wd, "config.example.yaml")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if errBootstrap := objectStoreInst.Bootstrap(ctx, examplePath); errBootstrap != nil {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			errBootstrap := objectStoreInst.Bootstrap(ctx, examplePath)
 			cancel()
-			log.Errorf("failed to bootstrap object-backed config: %v", errBootstrap)
-			return
+			if errBootstrap == nil {
+				break
+			}
+			log.WithError(errBootstrap).Warnf("failed to bootstrap object-backed config, retrying in %s", objectStoreBootstrapRetryDelay)
+			time.Sleep(objectStoreBootstrapRetryDelay)
 		}
-		cancel()
 		configFilePath = objectStoreInst.ConfigPath()
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 		if err == nil {

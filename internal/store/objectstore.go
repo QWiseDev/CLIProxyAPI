@@ -29,15 +29,17 @@ const (
 
 // ObjectStoreConfig captures configuration for the object storage-backed token store.
 type ObjectStoreConfig struct {
-	Endpoint  string
-	Bucket    string
-	AccessKey string
-	SecretKey string
-	Region    string
-	Prefix    string
-	LocalRoot string
-	UseSSL    bool
-	PathStyle bool
+	Endpoint         string
+	Bucket           string
+	AccessKey        string
+	SecretKey        string
+	Region           string
+	Prefix           string
+	LocalRoot        string
+	UseSSL           bool
+	PathStyle        bool
+	BootstrapRetries int
+	RetryDelay       time.Duration
 }
 
 // ObjectTokenStore persists configuration and authentication metadata using an S3-compatible object storage backend.
@@ -70,6 +72,12 @@ func NewObjectTokenStore(cfg ObjectStoreConfig) (*ObjectTokenStore, error) {
 	}
 	if cfg.SecretKey == "" {
 		return nil, fmt.Errorf("object store: secret key is required")
+	}
+	if cfg.BootstrapRetries < 0 {
+		cfg.BootstrapRetries = 0
+	}
+	if cfg.RetryDelay <= 0 {
+		cfg.RetryDelay = 2 * time.Second
 	}
 
 	root := strings.TrimSpace(cfg.LocalRoot)
@@ -143,16 +151,34 @@ func (s *ObjectTokenStore) Bootstrap(ctx context.Context, exampleConfigPath stri
 	if s == nil {
 		return fmt.Errorf("object store: not initialized")
 	}
-	if err := s.ensureBucket(ctx); err != nil {
-		return err
+	maxAttempts := s.cfg.BootstrapRetries + 1
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
-	if err := s.syncConfigFromBucket(ctx, exampleConfigPath); err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.ensureBucket(ctx); err != nil {
+			lastErr = err
+		} else if err := s.syncConfigFromBucket(ctx, exampleConfigPath); err != nil {
+			lastErr = err
+		} else if err := s.syncAuthFromBucket(ctx); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+		if attempt < maxAttempts {
+			log.WithError(lastErr).Warnf("object store: bootstrap attempt %d/%d failed, retrying", attempt, maxAttempts)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(s.cfg.RetryDelay):
+			}
+		}
 	}
-	if err := s.syncAuthFromBucket(ctx); err != nil {
-		return err
-	}
-	return nil
+	return lastErr
 }
 
 // Save persists authentication metadata to disk and uploads it to the object storage backend.
@@ -423,15 +449,18 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 		}
 		reader, errGet := s.client.GetObject(ctx, s.cfg.Bucket, object.Key, minio.GetObjectOptions{})
 		if errGet != nil {
-			return fmt.Errorf("object store: download auth %s: %w", object.Key, errGet)
+			log.WithError(errGet).WithField("key", object.Key).Warn("object store: skip auth download failure")
+			continue
 		}
 		data, errRead := io.ReadAll(reader)
 		_ = reader.Close()
 		if errRead != nil {
-			return fmt.Errorf("object store: read auth %s: %w", object.Key, errRead)
+			log.WithError(errRead).WithField("key", object.Key).Warn("object store: skip auth read failure")
+			continue
 		}
 		if errWrite := os.WriteFile(local, data, 0o600); errWrite != nil {
-			return fmt.Errorf("object store: write auth %s: %w", local, errWrite)
+			log.WithError(errWrite).WithField("path", local).Warn("object store: skip auth write failure")
+			continue
 		}
 	}
 	return nil
